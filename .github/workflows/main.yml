@@ -3,6 +3,11 @@ name: Scrape Foodies Profiles
 on:
   workflow_dispatch:
     inputs:
+      list_url:
+        description: 'Main list URL to scrape from (e.g. https://www.foodies.com/foods/ or any other page)'
+        required: true
+        default: 'https://www.foodies.com/foods/'
+        type: string
       max_profiles:
         description: 'Maximum number of profiles to scrape (e.g. 50)'
         required: true
@@ -35,6 +40,7 @@ jobs:
 
       - name: Scrape profiles and generate XLSX
         env:
+          LIST_URL: ${{ github.event.inputs.list_url }}
           MAX_PROFILES: ${{ github.event.inputs.max_profiles }}
           START_PAGE: ${{ github.event.inputs.start_page }}
         run: |
@@ -44,10 +50,14 @@ jobs:
           import requests
           from bs4 import BeautifulSoup
           import pandas as pd
-          from urllib.parse import urljoin
+          from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
 
-          BASE_URL = "https://www.foodies.com"
-          LIST_URL = "https://www.foodies.com/foods/"
+          LIST_URL = os.environ.get("LIST_URL", "https://www.foodies.com/foods/").strip()
+          if not LIST_URL.endswith("/") and "?" not in LIST_URL:
+              LIST_URL = LIST_URL + "/"
+          # Derive site origin for absolute image URLs
+          parsed = urlparse(LIST_URL)
+          BASE_URL = f"{parsed.scheme}://{parsed.netloc}"
           MAX_PROFILES = int(os.environ.get("MAX_PROFILES", "50"))
           START_PAGE = int(os.environ.get("START_PAGE", "1"))
 
@@ -64,13 +74,26 @@ jobs:
           page = START_PAGE
           seen = set()
 
-          print(f"Starting scrape: max={MAX_PROFILES}, start_page={START_PAGE}")
+          def build_page_url(base, page_num):
+              """Build paginated URL from any starting list URL."""
+              if page_num <= 1:
+                  # Keep original URL clean for page 1
+                  p = urlparse(base)
+                  qs = parse_qs(p.query)
+                  qs.pop("page", None)
+                  new_query = urlencode(qs, doseq=True)
+                  return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+              p = urlparse(base)
+              qs = parse_qs(p.query)
+              qs["page"] = [str(page_num)]
+              new_query = urlencode(qs, doseq=True)
+              return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+
+          print(f"Starting scrape from: {LIST_URL}")
+          print(f"max={MAX_PROFILES}, start_page={START_PAGE}")
 
           while len(profiles) < MAX_PROFILES:
-              if page == 1:
-                  url = LIST_URL
-              else:
-                  url = f"{LIST_URL}?page={page}"
+              url = build_page_url(LIST_URL, page)
 
               print(f"Fetching page {page}: {url}")
               try:
@@ -206,7 +229,9 @@ jobs:
       - name: Summary
         run: |
           echo "### Scrape complete" >> $GITHUB_STEP_SUMMARY
-          echo "Max requested: ${{ github.event.inputs.max_profiles }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: ${{ github.event.inputs.list_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Max profiles**: ${{ github.event.inputs.max_profiles }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Start page**: ${{ github.event.inputs.start_page }}" >> $GITHUB_STEP_SUMMARY
           if [ -f foodies_profiles.xlsx ]; then
-            echo "Artifact: foodies_profiles.xlsx uploaded" >> $GITHUB_STEP_SUMMARY
+            echo "- **Artifact**: foodies_profiles.xlsx uploaded" >> $GITHUB_STEP_SUMMARY
           fi
