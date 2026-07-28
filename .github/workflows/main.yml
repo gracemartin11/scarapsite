@@ -33,14 +33,14 @@ on:
         default: 'Profiles'
         type: string
       page_wait_ms:
-        description: 'Milliseconds to wait after a list page loads before scrolling/parsing (raise this if pages use lazy-load/JS rendering)'
+        description: 'Milliseconds to wait after a list page loads before scrolling/parsing (raise this ONLY if pages use lazy-load/JS rendering; lower = faster)'
         required: false
-        default: '3000'
+        default: '900'
         type: string
       profile_wait_ms:
-        description: 'Milliseconds to wait after a profile page loads before scraping it (raise this if image/about text loads late)'
+        description: 'Milliseconds to wait after a profile page loads before scraping it (raise this ONLY if image/about text loads late; lower = faster)'
         required: false
-        default: '2500'
+        default: '600'
         type: string
 jobs:
   scrape:
@@ -140,8 +140,8 @@ jobs:
           CONCURRENCY = max(1, int(os.environ.get("CONCURRENCY", "5") or "5"))
           START_PAGE = int(os.environ.get("START_PAGE", "1") or "1")
           SHEET_NAME = (os.environ.get("SHEET_NAME", "Profiles") or "Profiles").strip()
-          PAGE_WAIT_MS = int(os.environ.get("PAGE_WAIT_MS", "3000") or "3000")
-          PROFILE_WAIT_MS = int(os.environ.get("PROFILE_WAIT_MS", "2500") or "2500")
+          PAGE_WAIT_MS = int(os.environ.get("PAGE_WAIT_MS", "900") or "900")
+          PROFILE_WAIT_MS = int(os.environ.get("PROFILE_WAIT_MS", "600") or "600")
           DATA_DIR = Path("data")
           IMAGE_URLS_FILE = DATA_DIR / "image_urls.txt"
           XLSX_FILE = DATA_DIR / "foodies_profiles.xlsx"
@@ -149,7 +149,7 @@ jobs:
           DEBUG_HTML_FILE = DATA_DIR / "debug_first_profile.html"
           MAX_EMPTY_STREAK = 3
           MAX_RETRIES_PER_PAGE = 3
-          CHECKPOINT_EVERY = 10  # save to disk every N newly-scraped profiles, so a timeout never loses everything
+          CHECKPOINT_EVERY = 25  # save to disk every N newly-scraped profiles (kept in memory between writes — see save_checkpoint)
 
           BROWSER_ARGS = [
               "--disable-blink-features=AutomationControlled",
@@ -272,40 +272,46 @@ jobs:
           # very end, so a crash / timeout mid-run never loses everything.
           # ------------------------------------------------------------------
           save_lock = threading.Lock()
-          all_results = []  # accumulates across checkpoints, so the final write covers everything
+
+          # Load the existing sheet into memory ONCE. Every checkpoint after this
+          # appends to this in-memory frame and writes it out — it never re-reads
+          # the xlsx from disk again, which is what made checkpointing slow before
+          # (that re-read got more expensive every single time as the sheet grew).
+          if XLSX_FILE.exists():
+              try:
+                  book = load_workbook(XLSX_FILE, read_only=True)
+                  if SHEET_NAME in book.sheetnames:
+                      existing_df = pd.read_excel(XLSX_FILE, sheet_name=SHEET_NAME, engine="openpyxl")
+                  else:
+                      existing_df = pd.DataFrame(columns=["image_url", "full_name", "about", "profile_url"])
+                  book.close()
+              except Exception as e:
+                  log(f" ✗ Could not read existing xlsx ({e}) — starting this sheet fresh")
+                  existing_df = pd.DataFrame(columns=["image_url", "full_name", "about", "profile_url"])
+          else:
+              existing_df = pd.DataFrame(columns=["image_url", "full_name", "about", "profile_url"])
+          accumulated_new = []  # all new rows collected across the whole run, in memory
 
           def save_checkpoint(results_batch, reason=""):
-              """Append results_batch to the xlsx sheet and flush known_image_urls to disk."""
+              """Append results_batch to the in-memory frame and flush everything to disk."""
               with save_lock:
                   DATA_DIR.mkdir(parents=True, exist_ok=True)
-                  # --- image_urls.txt ---
+                  # --- image_urls.txt (cheap — always safe to do every checkpoint) ---
                   with open(IMAGE_URLS_FILE, "w", encoding="utf-8") as f:
                       for u in sorted(known_image_urls):
                           f.write(u + "\n")
-                  # --- xlsx ---
-                  new_df = pd.DataFrame(results_batch, columns=["image_url", "full_name", "about", "profile_url"])
-                  if XLSX_FILE.exists():
-                      try:
-                          book = load_workbook(XLSX_FILE)
-                          if SHEET_NAME in book.sheetnames:
-                              existing = pd.read_excel(XLSX_FILE, sheet_name=SHEET_NAME, engine="openpyxl")
-                              combined = pd.concat([existing, new_df], ignore_index=True)
-                              combined = combined.drop_duplicates(subset=["profile_url"], keep="first")
-                          else:
-                              combined = new_df
-                          with pd.ExcelWriter(XLSX_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-                              if SHEET_NAME in writer.book.sheetnames:
-                                  idx = writer.book.sheetnames.index(SHEET_NAME)
-                                  writer.book.remove(writer.book.worksheets[idx])
-                              combined.to_excel(writer, sheet_name=SHEET_NAME, index=False)
-                      except Exception as e:
-                          log(f" ✗ Checkpoint excel error: {e} → writing fresh file instead")
-                          new_df.to_excel(XLSX_FILE, sheet_name=SHEET_NAME, index=False, engine="openpyxl")
-                  else:
-                      new_df.to_excel(XLSX_FILE, sheet_name=SHEET_NAME, index=False, engine="openpyxl")
-                  shutil.copy(XLSX_FILE, OUT_XLSX)
+                  # --- xlsx: combine in-memory only, no disk re-read ---
+                  accumulated_new.extend(results_batch)
+                  new_df = pd.DataFrame(accumulated_new, columns=["image_url", "full_name", "about", "profile_url"])
+                  combined = pd.concat([existing_df, new_df], ignore_index=True)
+                  combined = combined.drop_duplicates(subset=["profile_url"], keep="first")
+                  try:
+                      combined.to_excel(XLSX_FILE, sheet_name=SHEET_NAME, index=False, engine="openpyxl")
+                      shutil.copy(XLSX_FILE, OUT_XLSX)
+                  except Exception as e:
+                      log(f" ✗ Checkpoint excel write error: {e}")
                   log(f" 💾 CHECKPOINT SAVED ({reason}) → {len(results_batch)} rows this batch, "
-                      f"{len(known_image_urls)} known image URLs on disk")
+                      f"{len(combined)} total rows, {len(known_image_urls)} known image URLs on disk")
 
           profile_urls = []
           seen_ids = set()
@@ -352,12 +358,9 @@ jobs:
                                   time.sleep(3 * attempt)
                                   continue
                               break
-                          # soft wait (configurable) + scrolls so lazy-loaded cards/images render
-                          page_obj.wait_for_timeout(PAGE_WAIT_MS)
-                          page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                          page_obj.wait_for_timeout(max(600, PAGE_WAIT_MS // 3))
+                          # single scroll-to-bottom + one configurable wait so lazy-loaded cards/images render
                           page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                          page_obj.wait_for_timeout(max(900, PAGE_WAIT_MS // 2))
+                          page_obj.wait_for_timeout(PAGE_WAIT_MS)
                           html = page_obj.content()
                           log(f" → HTML length: {len(html)}")
                           success = True
@@ -489,7 +492,7 @@ jobs:
                       log(" No more list pages.")
                       break
                   page += 1
-                  time.sleep(1.0)
+                  time.sleep(0.3)
               log("=" * 60)
               log(f"PHASE 1 DONE → {len(profile_urls)} profile URLs collected")
               log("=" * 60)
@@ -582,9 +585,8 @@ jobs:
                           t0 = time.time()
                           resp = page_obj.goto(purl, wait_until="domcontentloaded", timeout=45000)
                           log(f"[W{worker_id}]  goto done in {time.time()-t0:.1f}s | status={resp.status if resp else 'N/A'}")
-                          page_obj.wait_for_timeout(PROFILE_WAIT_MS)
                           page_obj.evaluate("window.scrollTo(0, 400)")
-                          page_obj.wait_for_timeout(max(500, PROFILE_WAIT_MS // 3))
+                          page_obj.wait_for_timeout(PROFILE_WAIT_MS)
                           html = page_obj.content()
                       except Exception as e:
                           log(f"[W{worker_id}]  ✗ ERROR loading profile: {type(e).__name__}: {e}")
@@ -636,7 +638,6 @@ jobs:
                       if since_last_checkpoint >= CHECKPOINT_EVERY:
                           save_checkpoint(local_results[-since_last_checkpoint:], reason=f"W{worker_id} +{since_last_checkpoint}")
                           since_last_checkpoint = 0
-                      time.sleep(0.5)
                   if since_last_checkpoint > 0:
                       save_checkpoint(local_results[-since_last_checkpoint:], reason=f"W{worker_id} final +{since_last_checkpoint}")
                   browser.close()
@@ -692,15 +693,17 @@ jobs:
                   f.write(u + "\n")
           log(f"Wrote {len(known_image_urls)} image URLs → {IMAGE_URLS_FILE}")
 
-          if XLSX_FILE.exists():
-              try:
-                  existing = pd.read_excel(XLSX_FILE, sheet_name=SHEET_NAME, engine="openpyxl") if SHEET_NAME in load_workbook(XLSX_FILE).sheetnames else pd.DataFrame(columns=["image_url", "full_name", "about", "profile_url"])
-                  log(f"Final state → sheet '{SHEET_NAME}' has {len(existing)} total rows (includes checkpointed data from this run)")
-              except Exception as e:
-                  log(f"Could not re-read final xlsx for summary: {e}")
+          if accumulated_new:
+              final_df = pd.concat([existing_df, pd.DataFrame(accumulated_new, columns=["image_url", "full_name", "about", "profile_url"])], ignore_index=True)
+              final_df = final_df.drop_duplicates(subset=["profile_url"], keep="first")
+              final_df.to_excel(XLSX_FILE, sheet_name=SHEET_NAME, index=False, engine="openpyxl")
+              shutil.copy(XLSX_FILE, OUT_XLSX)
+              log(f"Final state → sheet '{SHEET_NAME}' has {len(final_df)} total rows")
+          elif XLSX_FILE.exists():
+              shutil.copy(XLSX_FILE, OUT_XLSX)
+              log(f"No new rows this run → sheet '{SHEET_NAME}' unchanged at {len(existing_df)} rows")
           else:
-              log("No xlsx file exists even after checkpointing — no profiles were ever successfully scraped this run.")
-          shutil.copy(XLSX_FILE, OUT_XLSX) if XLSX_FILE.exists() else None
+              log("No xlsx file exists — no profiles were ever successfully scraped this run.")
           log("=" * 60)
           log(f"SCRAPE FINISHED → {len(results)} new profiles")
           log("=" * 60)
