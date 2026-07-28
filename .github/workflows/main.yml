@@ -204,6 +204,7 @@ jobs:
                       "--disable-blink-features=AutomationControlled",
                       "--no-sandbox",
                       "--disable-dev-shm-usage",
+                      "--disable-http2",  # this site's HTTP/2 handshake fails against headless Chromium
                   ],
               )
               context = browser.new_context(
