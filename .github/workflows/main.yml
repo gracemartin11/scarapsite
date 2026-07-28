@@ -510,64 +510,35 @@ jobs:
           stats_lock = threading.Lock()
           debug_html_saved = threading.Event()
 
-          def extract_profile(soup, purl):
-              title = (soup.title.string or "").strip() if soup.title else ""
-              full_name = ""
-              for sel in [
-                  "h1", "h1.name", "h1.profile-name", ".profile-name", ".full-name",
-                  ".card-title", "[class*='name']", "h2", "h3",
-              ]:
-                  el = soup.select_one(sel)
-                  if el:
-                      t = el.get_text(strip=True)
-                      if t and len(t) < 120:
-                          full_name = t
-                          break
-              if not full_name and title:
-                  full_name = title.split("|")[0].split("-")[0].strip()
-              about = ""
-              for sel in [
-                  ".about", ".bio", ".description", ".profile-about", ".profile-bio",
-                  "[class*='about']", "[class*='bio']", "[class*='description']",
-                  ".card-body p", "section p", "article p", "p",
-              ]:
-                  els = soup.select(sel)
-                  for el in els:
-                      t = el.get_text(" ", strip=True)
-                      t = re.sub(r"\s+", " ", t).strip()
-                      if 20 < len(t) < 2000:
-                          about = t
-                          break
-                  if about:
-                      break
+          def extract_profile(soup, purl, html):
+              # --- image_url + full_name: <div class="card-image"><img src=... alt="Chef Sultan">...
               image_url = ""
-              for sel in [
-                  "img.profile-image", "img.avatar", "img[class*='profile']",
-                  "img[class*='avatar']", "img[class*='photo']",
-                  "meta[property='og:image']", "meta[name='twitter:image']",
-                  "img",
-              ]:
-                  if sel.startswith("meta"):
-                      el = soup.select_one(sel)
-                      if el and el.get("content"):
-                          image_url = urljoin(BASE_URL, el["content"])
-                          break
-                  else:
-                      for img in soup.select(sel):
-                          src = (
-                              img.get("src")
-                              or img.get("data-src")
-                              or img.get("data-lazy-src")
-                              or img.get("data-original")
-                              or ""
-                          )
-                          if (src and not src.startswith("data:")
-                                  and "icon" not in src.lower()
-                                  and "logo" not in src.lower()):
-                              image_url = urljoin(BASE_URL, src)
-                              break
-                  if image_url:
-                      break
+              full_name = ""
+              img_el = soup.select_one("div.card-image img")
+              if img_el:
+                  src = img_el.get("src") or img_el.get("data-src") or img_el.get("data-lazy-src") or ""
+                  if src and not src.startswith("data:"):
+                      image_url = urljoin(BASE_URL, src)
+                  alt = (img_el.get("alt") or "").strip()
+                  if alt:
+                      full_name = alt
+              # fallback: the visible name is injected via CSS `.card-title::before { content: "..." }`
+              # in an inline <style> block — not real element text, so pull it out with regex instead.
+              if not full_name:
+                  m = re.search(r"\.card-title::before\s*\{[^}]*content:\s*[\"']([^\"']+)[\"']", html)
+                  if m:
+                      full_name = m.group(1).strip()
+              # last-resort fallback: page <title>
+              if not full_name and soup.title:
+                  full_name = (soup.title.string or "").split("|")[0].split("-")[0].strip()
+
+              # --- about: <div class="desc"><div class="subtitle">About:</div><p>...</p></div>
+              about = ""
+              desc_el = soup.select_one("div.desc p") or soup.select_one("div.desc")
+              if desc_el:
+                  about = desc_el.get_text(" ", strip=True)
+                  about = re.sub(r"^About:\s*", "", about, flags=re.I).strip()
+
               return full_name, about, image_url
 
           def worker_scrape(chunk, worker_id):
@@ -609,7 +580,7 @@ jobs:
                           except Exception:
                               pass
                       soup = BeautifulSoup(html, "lxml")
-                      full_name, about, image_url = extract_profile(soup, purl)
+                      full_name, about, image_url = extract_profile(soup, purl, html)
                       with stats_lock:
                           extraction_stats["total"] += 1
                           if full_name:
