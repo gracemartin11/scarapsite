@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       list_url:
-        description: 'Main list URL (e.g. https://foodies.com/food/ or https://www.foodies.com/foods/)'
+        description: 'Main list URL (must be full URL, e.g. https://www.example.com/masterchef/)'
         required: true
         default: 'https://foodies.com/food/'
         type: string
       max_profiles:
-        description: 'Maximum number of NEW profiles to scrape this run (e.g. 50)'
+        description: 'Maximum number of NEW profiles to scrape this run'
         required: true
         default: '50'
         type: string
@@ -60,15 +60,13 @@ jobs:
             echo "ERROR: Secret RCLONE_CONFIG_MEGA is empty. Add it in repo Settings → Secrets."
             exit 1
           fi
-          # The secret should contain the full [mega] section (or complete rclone.conf content)
           echo "$RCLONE_CONFIG_MEGA" > ~/.config/rclone/rclone.conf
           echo "rclone.conf written"
           rclone listremotes
 
-      - name: Download previous state from Mega.nz (image_urls.txt + xlsx)
+      - name: Download previous state from Mega.nz
         run: |
           mkdir -p data
-          # Try to download existing files (ignore errors if first run)
           rclone copy mega:foodies-scrape/image_urls.txt data/ --ignore-errors || true
           rclone copy mega:foodies-scrape/foodies_profiles.xlsx data/ --ignore-errors || true
           ls -la data/ || true
@@ -97,30 +95,88 @@ jobs:
           import sys
           import time
           import re
+          import socket
+          import traceback
           from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
-          from playwright.sync_api import sync_playwright
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
           from bs4 import BeautifulSoup
           import pandas as pd
-          from openpyxl import load_workbook, Workbook
-          from pathlib import Path
+          from openpyxl import load_workbook
+          import shutil
 
           def log(msg):
               ts = time.strftime("%H:%M:%S")
               print(f"[{ts}] {msg}", flush=True)
               sys.stdout.flush()
 
-          LIST_URL = os.environ.get("LIST_URL", "https://foodies.com/food/").strip()
+          # ------------------------------------------------------------------
+          # Config
+          # ------------------------------------------------------------------
+          LIST_URL = os.environ.get("LIST_URL", "").strip()
           MAX_PROFILES = int(os.environ.get("MAX_PROFILES", "50"))
           START_PAGE = int(os.environ.get("START_PAGE", "1"))
-          SHEET_NAME = os.environ.get("SHEET_NAME", "Profiles").strip() or "Profiles"
+          SHEET_NAME = (os.environ.get("SHEET_NAME", "Profiles") or "Profiles").strip()
 
           DATA_DIR = Path("data")
           IMAGE_URLS_FILE = DATA_DIR / "image_urls.txt"
           XLSX_FILE = DATA_DIR / "foodies_profiles.xlsx"
-          OUT_XLSX = Path("foodies_profiles.xlsx")  # also keep in workspace root for artifact
+          OUT_XLSX = Path("foodies_profiles.xlsx")
+
+          MAX_EMPTY_STREAK = 3
+          MAX_RETRIES_PER_PAGE = 3
+
+          # ------------------------------------------------------------------
+          # URL validation + diagnostics
+          # ------------------------------------------------------------------
+          log("=" * 60)
+          log("URL & NETWORK DIAGNOSTICS")
+          log("=" * 60)
+
+          if not LIST_URL:
+              log("ERROR: list_url is empty")
+              raise SystemExit(1)
+
+          if not LIST_URL.startswith(("http://", "https://")):
+              log(f"ERROR: list_url must start with http:// or https://")
+              log(f"       Got: {LIST_URL!r}")
+              raise SystemExit(1)
 
           parsed = urlparse(LIST_URL)
+          if not parsed.netloc:
+              log(f"ERROR: list_url has no domain (netloc is empty)")
+              log(f"       Got: {LIST_URL!r}")
+              log("       Example of a valid URL: https://www.example.com/masterchef/")
+              raise SystemExit(1)
+
           BASE_URL = f"{parsed.scheme}://{parsed.netloc}"
+          log(f" list_url     = {LIST_URL}")
+          log(f" BASE_URL     = {BASE_URL}")
+          log(f" max_profiles = {MAX_PROFILES}  (new ones this run)")
+          log(f" start_page   = {START_PAGE}")
+          log(f" sheet_name   = {SHEET_NAME}")
+
+          # DNS check
+          host = parsed.netloc.split(":")[0]
+          try:
+              ips = socket.getaddrinfo(host, None)
+              unique_ips = sorted({item[4][0] for item in ips})
+              log(f" DNS OK → {host} resolves to: {', '.join(unique_ips)}")
+          except socket.gaierror as e:
+              log(f" DNS FAILED for host '{host}': {e}")
+              log(" → Site domain does not exist or DNS is blocked from this runner")
+              log(" → Fix the URL or check if the domain is correct")
+              raise SystemExit(1)
+
+          # Quick TCP connectivity check (port 443 / 80)
+          port = 443 if parsed.scheme == "https" else 80
+          try:
+              sock = socket.create_connection((host, port), timeout=10)
+              sock.close()
+              log(f" TCP connect to {host}:{port} → OK")
+          except Exception as e:
+              log(f" TCP connect to {host}:{port} FAILED: {type(e).__name__}: {e}")
+              log(" → Possible causes: site down, firewall, GitHub runner IP blocked, or geo-restriction")
 
           def build_page_url(base: str, page_num: int) -> str:
               p = urlparse(base)
@@ -132,7 +188,9 @@ jobs:
               new_query = urlencode(qs, doseq=True)
               return urlunparse((p.scheme, p.netloc, p.path or "/", p.params, new_query, p.fragment))
 
-          # ---------- Load already-known image URLs (to skip duplicates) ----------
+          # ------------------------------------------------------------------
+          # Load already-known image URLs
+          # ------------------------------------------------------------------
           known_image_urls = set()
           if IMAGE_URLS_FILE.exists():
               with open(IMAGE_URLS_FILE, "r", encoding="utf-8") as f:
@@ -140,84 +198,156 @@ jobs:
                       u = line.strip()
                       if u:
                           known_image_urls.add(u)
-          log(f"Loaded {len(known_image_urls)} known image URLs (will skip matches)")
+          log(f" Loaded {len(known_image_urls)} known image URLs (will skip matches)")
 
           profile_urls = []
           seen_ids = set()
           page = START_PAGE
           empty_pages_streak = 0
-          MAX_EMPTY_STREAK = 3   # stop after 3 consecutive pages with no NEW profiles
 
           log("=" * 60)
           log("PHASE 1: Collect profile URLs from list pages")
-          log(f" list_url     = {LIST_URL}")
-          log(f" BASE_URL     = {BASE_URL}")
-          log(f" max_profiles = {MAX_PROFILES}  (new ones this run)")
-          log(f" start_page   = {START_PAGE}")
-          log(f" sheet_name   = {SHEET_NAME}")
           log("=" * 60)
 
           with sync_playwright() as p:
-              log("Launching Playwright + Chromium ...")
+              log("Launching Playwright + Chromium (HTTP/2 disabled + stealth) ...")
               browser = p.chromium.launch(
                   headless=True,
                   args=[
                       "--disable-blink-features=AutomationControlled",
                       "--no-sandbox",
                       "--disable-dev-shm-usage",
+                      "--disable-http2",
+                      "--disable-features=IsolateOrigins,site-per-process",
+                      "--ignore-certificate-errors",
+                      "--disable-web-security",
                   ],
               )
               log(" Chromium launched")
+
               context = browser.new_context(
-                  user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                  user_agent=(
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/122.0.0.0 Safari/537.36"
+                  ),
                   viewport={"width": 1280, "height": 900},
                   locale="en-US",
+                  extra_http_headers={
+                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                      "Accept-Language": "en-US,en;q=0.9",
+                      "Accept-Encoding": "gzip, deflate, br",
+                      "Upgrade-Insecure-Requests": "1",
+                      "Sec-Fetch-Dest": "document",
+                      "Sec-Fetch-Mode": "navigate",
+                      "Sec-Fetch-Site": "none",
+                      "Sec-Fetch-User": "?1",
+                  },
               )
               context.add_init_script("""
                   Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                  Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                  Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                  window.chrome = { runtime: {} };
               """)
+
               page_obj = context.new_page()
               log(" Browser context + page ready")
+
               page_obj.on("console", lambda msg: log(f" [browser] {msg.type}: {msg.text}"))
               page_obj.on("pageerror", lambda err: log(f" [page error] {err}"))
-              page_obj.on("requestfailed", lambda req: log(f" [req failed] {req.url[:80]} → {req.failure}"))
+              page_obj.on("requestfailed", lambda req: log(
+                  f" [req failed] {req.url[:100]} → {req.failure}"
+              ))
 
-              # ========== PHASE 1: collect profile links ==========
+              # ========== PHASE 1 ==========
               while len(profile_urls) < MAX_PROFILES:
                   url = build_page_url(LIST_URL, page)
                   log("-" * 50)
                   log(f"LIST PAGE {page} → {url}")
                   log(f" collected so far: {len(profile_urls)} / {MAX_PROFILES}")
 
-                  try:
-                      log(" → goto() ...")
-                      t0 = time.time()
-                      resp = page_obj.goto(url, wait_until="domcontentloaded", timeout=60000)
-                      log(f" → goto done in {time.time()-t0:.1f}s | status={resp.status if resp else 'N/A'}")
-                      log(" → wait 2s for JS ...")
-                      page_obj.wait_for_timeout(2000)
-                      log(" → scroll middle ...")
-                      page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                      page_obj.wait_for_timeout(800)
-                      log(" → scroll bottom ...")
-                      page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                      page_obj.wait_for_timeout(1200)
-                      html = page_obj.content()
-                      log(f" → HTML length: {len(html)}")
-                  except Exception as e:
-                      log(f" ✗ ERROR on list page {page}: {type(e).__name__}: {e}")
+                  success = False
+                  last_error = None
+
+                  for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
+                      try:
+                          log(f" → goto() attempt {attempt}/{MAX_RETRIES_PER_PAGE} ...")
+                          t0 = time.time()
+                          resp = page_obj.goto(url, wait_until="domcontentloaded", timeout=60000)
+                          elapsed = time.time() - t0
+                          status = resp.status if resp else "N/A"
+                          log(f" → goto done in {elapsed:.1f}s | HTTP status = {status}")
+
+                          if resp and resp.status >= 400:
+                              log(f" ✗ HTTP error status {resp.status}")
+                              if resp.status in (403, 429, 503):
+                                  log("   → Possible IP block / rate-limit / bot protection")
+                              last_error = f"HTTP {resp.status}"
+                              if attempt < MAX_RETRIES_PER_PAGE:
+                                  time.sleep(3 * attempt)
+                                  continue
+                              break
+
+                          # soft wait + scrolls
+                          page_obj.wait_for_timeout(2000)
+                          page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                          page_obj.wait_for_timeout(800)
+                          page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                          page_obj.wait_for_timeout(1200)
+
+                          html = page_obj.content()
+                          log(f" → HTML length: {len(html)}")
+                          success = True
+                          break
+
+                      except PlaywrightTimeout as e:
+                          last_error = f"Timeout: {e}"
+                          log(f" ✗ attempt {attempt} TIMEOUT: {e}")
+                      except Exception as e:
+                          last_error = f"{type(e).__name__}: {e}"
+                          log(f" ✗ attempt {attempt} failed: {last_error}")
+
+                          # classify common errors
+                          err_str = str(e).lower()
+                          if "err_http2_protocol_error" in err_str or "http2" in err_str:
+                              log("   → HTTP/2 protocol error (common with bot protection or bad CDN)")
+                          elif "err_connection_refused" in err_str:
+                              log("   → Connection refused – site may be down or blocking this IP")
+                          elif "err_name_not_resolved" in err_str or "dns" in err_str:
+                              log("   → DNS failure – domain does not resolve")
+                          elif "err_connection_timed_out" in err_str or "timeout" in err_str:
+                              log("   → Connection timeout – network issue or site very slow / blocked")
+                          elif "err_ssl" in err_str or "certificate" in err_str:
+                              log("   → SSL/TLS problem")
+                          elif "net::err_" in err_str:
+                              log(f"   → Chromium network error: {e}")
+
+                      if attempt < MAX_RETRIES_PER_PAGE:
+                          wait = 2 * attempt
+                          log(f"   waiting {wait}s before retry ...")
+                          time.sleep(wait)
+
+                  if not success:
+                      log(f" All {MAX_RETRIES_PER_PAGE} attempts failed for page {page}")
+                      log(f" Last error: {last_error}")
                       empty_pages_streak += 1
                       if empty_pages_streak >= MAX_EMPTY_STREAK:
                           log(f" {MAX_EMPTY_STREAK} consecutive failures → stop Phase 1")
+                          log(" Possible reasons:")
+                          log("   • Site is blocking GitHub Actions IPs")
+                          log("   • Domain is wrong / site is down")
+                          log("   • Strong bot protection (Cloudflare, etc.)")
+                          log("   • Network / HTTP2 issues from the runner")
                           break
                       page += 1
                       continue
 
+                  # ----- parse links -----
                   soup = BeautifulSoup(html, "lxml")
                   title = (soup.title.string or "(no title)").strip() if soup.title else "(no title)"
                   log(f" Page title: {title}")
 
-                  # YOUR SELECTOR
                   links = soup.select("div.grid_item a[href*='/profile/']")
                   log(f" selector 'div.grid_item a[href*=\"/profile/\"]' → {len(links)}")
                   if not links:
@@ -231,17 +361,25 @@ jobs:
                       log(f" fallback 'a[href*=\"profile\"]' → {len(links)}")
 
                   if not links:
-                      body_preview = (soup.body.get_text(" ", strip=True)[:250] if soup.body else "")
+                      body_preview = (soup.body.get_text(" ", strip=True)[:300] if soup.body else "")
                       log(f" Body text preview: {body_preview!r}")
                       sample = soup.select("div[class]")[:12]
                       log(" Sample div classes:")
                       for d in sample:
-                          log(f" class=\"{' '.join(d.get('class', []))}\"")
+                          log(f"   class=\"{' '.join(d.get('class', []))}\"")
                       paginator = soup.select_one("div.paginator")
                       log(f" paginator present: {bool(paginator)}")
+
+                      # detect common block pages
+                      lower_body = body_preview.lower()
+                      if any(x in lower_body for x in ["cloudflare", "attention required", "just a moment", "access denied", "blocked"]):
+                          log(" !!! Looks like a Cloudflare / bot-protection / access-denied page")
+                      if "captcha" in lower_body:
+                          log(" !!! CAPTCHA detected")
+
                       empty_pages_streak += 1
                       if empty_pages_streak >= MAX_EMPTY_STREAK:
-                          log(f" No links for {MAX_EMPTY_STREAK} pages → stop Phase 1")
+                          log(f" No usable links for {MAX_EMPTY_STREAK} pages → stop Phase 1")
                           break
                       page += 1
                       continue
@@ -275,14 +413,14 @@ jobs:
                   else:
                       empty_pages_streak = 0
 
+                  # next page detection
                   next_link = soup.select_one(
                       "div.paginator a.next, a.next.pill, a[aria-label='Next page'], a[title='Next page']"
                   )
                   has_next = bool(next_link and next_link.get("href"))
-                  log(f" next_link: {has_next}")
+                  log(f" next_link present: {has_next}")
                   if not has_next:
                       page_links = soup.select("div.paginator a[href*='page='], a.pill[href*='page=']")
-                      log(f" page= links: {len(page_links)}")
                       if page_links:
                           try:
                               nums = [
@@ -290,7 +428,7 @@ jobs:
                                   for a in page_links if re.search(r"page=(\d+)", a.get("href", ""))
                               ]
                               max_p = max(nums) if nums else page
-                              log(f" highest page num: {max_p}")
+                              log(f" highest page num found: {max_p}")
                               if page < max_p:
                                   has_next = True
                           except Exception as e:
@@ -305,14 +443,13 @@ jobs:
               log(f"PHASE 1 DONE → {len(profile_urls)} profile URLs collected")
               log("=" * 60)
 
+              results = []
               if not profile_urls:
-                  log("No profile URLs found. Will still upload existing state.")
-                  results = []
+                  log("No profile URLs found. Will still save / upload existing state.")
               else:
-                  # ========== PHASE 2: visit each profile ==========
+                  # ========== PHASE 2 ==========
                   log("PHASE 2: Visit each profile page and extract name / about / image")
                   log("=" * 60)
-                  results = []
                   skipped_dup = 0
 
                   for i, purl in enumerate(profile_urls, 1):
@@ -399,14 +536,16 @@ jobs:
                                       or img.get("data-original")
                                       or ""
                                   )
-                                  if src and not src.startswith("data:") and "icon" not in src.lower() and "logo" not in src.lower():
+                                  if (src and not src.startswith("data:")
+                                          and "icon" not in src.lower()
+                                          and "logo" not in src.lower()):
                                       image_url = urljoin(BASE_URL, src)
                                       log(f" image via '{sel}': {image_url[:90]}")
                                       break
                           if image_url:
                               break
 
-                      # ---------- SKIP if image_url already known ----------
+                      # skip known image
                       if image_url and image_url in known_image_urls:
                           log(f" ⏭ SKIP duplicate image_url: {image_url[:80]}...")
                           skipped_dup += 1
@@ -419,24 +558,28 @@ jobs:
                           "profile_url": purl,
                       })
                       if image_url:
-                          known_image_urls.add(image_url)  # avoid same-run dups too
+                          known_image_urls.add(image_url)
                       log(f" ✓ saved: name={full_name[:40]!r} | img={bool(image_url)} | about_len={len(about)}")
                       time.sleep(0.8)
 
-                  log(f"PHASE 2 DONE → {len(results)} new profiles saved, {skipped_dup} duplicates skipped")
+                  log(f"PHASE 2 DONE → {len(results)} new profiles, {skipped_dup} duplicates skipped")
 
               log("Closing browser ...")
               browser.close()
               log("Browser closed")
 
-          # ---------- Persist image_urls.txt ----------
+          # ------------------------------------------------------------------
+          # Persist image_urls.txt
+          # ------------------------------------------------------------------
           DATA_DIR.mkdir(parents=True, exist_ok=True)
           with open(IMAGE_URLS_FILE, "w", encoding="utf-8") as f:
               for u in sorted(known_image_urls):
                   f.write(u + "\n")
           log(f"Wrote {len(known_image_urls)} image URLs → {IMAGE_URLS_FILE}")
 
-          # ---------- Append / create Excel sheet ----------
+          # ------------------------------------------------------------------
+          # Append / create Excel sheet
+          # ------------------------------------------------------------------
           new_df = pd.DataFrame(results, columns=["image_url", "full_name", "about", "profile_url"])
           log(f"New rows this run: {len(new_df)}")
 
@@ -447,15 +590,12 @@ jobs:
                       log(f"Sheet '{SHEET_NAME}' already exists → will append")
                       existing = pd.read_excel(XLSX_FILE, sheet_name=SHEET_NAME, engine="openpyxl")
                       combined = pd.concat([existing, new_df], ignore_index=True)
-                      # optional: drop exact row duplicates
                       combined = combined.drop_duplicates(subset=["image_url", "profile_url"], keep="first")
                   else:
                       log(f"Sheet '{SHEET_NAME}' does not exist → create new")
                       combined = new_df
-                      existing = None
-                  # Write all sheets back (preserve other tabs)
+
                   with pd.ExcelWriter(XLSX_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-                      # first remove the target sheet if it exists so we can rewrite cleanly
                       if SHEET_NAME in writer.book.sheetnames:
                           idx = writer.book.sheetnames.index(SHEET_NAME)
                           writer.book.remove(writer.book.worksheets[idx])
@@ -468,8 +608,6 @@ jobs:
               log(f"No previous xlsx → creating new with sheet '{SHEET_NAME}'")
               new_df.to_excel(XLSX_FILE, sheet_name=SHEET_NAME, index=False, engine="openpyxl")
 
-          # Also copy to workspace root for artifact upload
-          import shutil
           shutil.copy(XLSX_FILE, OUT_XLSX)
           log(f"Saved {OUT_XLSX} (and {XLSX_FILE})")
 
